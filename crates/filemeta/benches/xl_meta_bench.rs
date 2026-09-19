@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_filemeta::{FileMeta, MetaCacheEntry, test_data::*};
+use rustfs_filemeta::{
+    FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, ObjectPartInfo, get_file_info, test_data::*,
+};
 use std::hint::black_box;
 
 fn bench_create_real_xlmeta(c: &mut Criterion) {
@@ -134,6 +136,68 @@ fn bench_list_page_to_fileinfo(c: &mut Criterion) {
     group.finish();
 }
 
+// Per-disk metadata work shared by ordinary HEAD/GET and the PUT commit path.
+// The object is an uncompressed, single-part video with no optional features.
+fn bench_object_metadata(c: &mut Criterion) {
+    let mut fi = FileInfo::new("video/S06E21/clip.mp4", 4, 2);
+    fi.volume = "bucket".to_owned();
+    fi.name = "video/S06E21/clip.mp4".to_owned();
+    fi.size = 4 * 1024 * 1024;
+    fi.erasure.index = 1;
+    fi.data_dir = Some(uuid::Uuid::from_u128(1));
+    fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture timestamp"));
+    fi.metadata = [
+        ("etag".to_owned(), "f5e89f73c9242db8f5e984bce5ab3926".to_owned()),
+        ("content-type".to_owned(), "video/mp4".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    fi.parts = vec![ObjectPartInfo {
+        number: 1,
+        size: 4 * 1024 * 1024,
+        actual_size: fi.size,
+        ..Default::default()
+    }];
+    let mut meta = FileMeta::new();
+    meta.add_version(fi.clone()).expect("encode fixture version");
+    let encoded = meta.marshal_msg().expect("encode fixture metadata");
+    let mut group = c.benchmark_group("object_metadata/plain_video");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("decode_validate", |b| {
+        b.iter(|| {
+            let decoded = get_file_info(
+                black_box(&encoded),
+                "bucket",
+                "video/S06E21/clip.mp4",
+                "",
+                FileInfoOpts {
+                    data: true,
+                    include_free_versions: false,
+                    include_part_checksums: false,
+                },
+            )
+            .expect("decode object metadata");
+            decoded.validate_for_metadata_read().expect("validate object metadata");
+            black_box(decoded);
+        })
+    });
+    group.bench_function("create_version", |b| {
+        b.iter(|| {
+            let mut created = FileMeta::new();
+            created.add_version(fi.clone()).expect("create object metadata");
+            black_box(created.marshal_msg().expect("encode new object metadata"));
+        })
+    });
+    group.bench_function("read_modify_write", |b| {
+        b.iter(|| {
+            let mut loaded = FileMeta::load(black_box(&encoded)).expect("load object metadata");
+            loaded.add_version(fi.clone()).expect("update object metadata");
+            black_box(loaded.marshal_msg().expect("encode updated object metadata"));
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_create_real_xlmeta,
@@ -147,7 +211,8 @@ criterion_group!(
     bench_version_stats,
     bench_validate_integrity,
     bench_into_fileinfo_realistic,
-    bench_list_page_to_fileinfo
+    bench_list_page_to_fileinfo,
+    bench_object_metadata
 );
 
 criterion_main!(benches);
