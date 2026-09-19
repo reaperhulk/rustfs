@@ -641,6 +641,7 @@ pin_project! {
         #[pin]
         reader: Option<R>,
         capacity: usize,
+        buffer: BytesMut,
         strategy: &'static str,
         buffer_source: &'static str,
         remaining: usize,
@@ -704,6 +705,7 @@ where
         }
         Self {
             reader: Some(reader),
+            buffer: BytesMut::new(),
             capacity,
             strategy,
             buffer_source,
@@ -1147,12 +1149,15 @@ where
             None => return Poll::Ready(None),
         };
         let read_capacity = (*this.capacity).min(*this.remaining);
-        let mut buf = BytesMut::with_capacity(read_capacity);
-        let poll_read = poll_read_buf(reader, cx, &mut buf);
+        // Keep the allocation across Pending until the reader can fill it.
+        if this.buffer.capacity() == 0 {
+            *this.buffer = BytesMut::with_capacity(read_capacity);
+        }
+        let poll_read = poll_read_buf(reader, cx, this.buffer);
 
         let result: Poll<Option<Self::Item>> = match poll_read {
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
-                let bytes = buf.freeze();
+                let bytes = std::mem::take(this.buffer).freeze();
                 *this.remaining -= bytes.len();
                 *this.emitted += bytes.len();
                 #[cfg(feature = "tracing-chunk-debug")]
@@ -1171,6 +1176,7 @@ where
                 }
             }
             Poll::Ready(Ok(_)) => {
+                *this.buffer = BytesMut::new();
                 this.reader.set(None);
                 let remaining = i64::try_from(*this.remaining).unwrap_or(i64::MAX);
                 let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining });
@@ -1210,6 +1216,7 @@ where
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
             Poll::Ready(Err(err)) => {
+                *this.buffer = BytesMut::new();
                 this.reader.set(None);
                 let error_class = classify_get_object_stream_read_error(&err);
                 record_get_object_reader_stream_failure(
@@ -10339,6 +10346,113 @@ mod tests {
 
         assert_eq!(first.as_ref(), b"he");
         assert_eq!(stream.remaining_length().exact(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_retains_buffer_across_pending() {
+        use tokio::io::AsyncWriteExt;
+
+        let (reader, mut writer) = tokio::io::duplex(16);
+        let mut stream = GetObjectReaderStream::new(reader, 2, 5, "standard", GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut chunks = Vec::new();
+        for input in [b"he".as_slice(), b"ll", b"o!"] {
+            let remaining = stream.remaining;
+            assert!(stream.poll_next_unpin(&mut cx).is_pending());
+            assert_eq!(stream.buffer.capacity(), remaining.min(2));
+            assert!(stream.buffer.is_empty());
+            let allocation = stream.buffer.as_ptr();
+            assert!(stream.poll_next_unpin(&mut cx).is_pending());
+            assert_eq!(stream.buffer.as_ptr(), allocation);
+            assert_eq!(stream.remaining_length().exact(), Some(remaining));
+
+            writer.write_all(input).await.expect("make the next chunk readable");
+            chunks.push(stream.next().await.expect("emit a chunk").expect("read the chunk"));
+            assert_eq!(stream.buffer.capacity(), 0, "emitted bytes own the allocation");
+        }
+        assert!(stream.next().await.is_none());
+        assert_eq!(stream.remaining_length().exact(), Some(0));
+        assert_eq!(
+            chunks,
+            vec![Bytes::from_static(b"he"), Bytes::from_static(b"ll"), Bytes::from_static(b"o")]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_reader_stream_releases_pending_buffer_on_failure() {
+        struct PendingOnce<R> {
+            inner: R,
+            pending: bool,
+        }
+        impl<R: AsyncRead + Unpin> AsyncRead for PendingOnce<R> {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.pending {
+                    self.pending = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        for (error, expected_kind) in [
+            (None, std::io::ErrorKind::UnexpectedEof),
+            (Some(std::io::Error::other("injected failure")), std::io::ErrorKind::Other),
+        ] {
+            let reader = PendingOnce {
+                inner: FailAtEndReader::new(b"he", error),
+                pending: true,
+            };
+            let mut stream = GetObjectReaderStream::new(reader, 2, 5, "standard", GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(stream.poll_next_unpin(&mut cx).is_pending());
+            assert_eq!(stream.buffer.capacity(), 2);
+            let first = stream.next().await.expect("emit initial bytes").expect("read initial bytes");
+            assert_eq!(first.as_ref(), b"he");
+            stream.reader.as_mut().expect("reader remains active").pending = true;
+            assert!(stream.poll_next_unpin(&mut cx).is_pending());
+            assert_eq!(stream.buffer.capacity(), 2);
+
+            let err = stream
+                .next()
+                .await
+                .expect("report incomplete body")
+                .expect_err("reader must fail");
+            assert_eq!(err.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(expected_kind));
+            assert!(stream.reader.is_none());
+            assert_eq!(stream.buffer.capacity(), 0);
+            assert!(stream.next().await.is_none());
+            assert_eq!(first.as_ref(), b"he", "failure must not change emitted bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_cancels_while_pending() {
+        use tokio::io::AsyncWriteExt;
+
+        let (reader, mut writer) = tokio::io::duplex(16);
+        let mut stream = GetObjectReaderStream::new(reader, 64, 5, "standard", GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(stream.poll_next_unpin(&mut cx).is_pending());
+        assert_eq!(stream.buffer.capacity(), 5);
+        drop(stream);
+        assert_eq!(
+            writer
+                .write_all(b"x")
+                .await
+                .expect_err("cancellation drops the reader")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn get_object_reader_stream_empty_body_does_not_allocate() {
+        let mut stream = GetObjectReaderStream::new(PendingReader, 64, 0, "standard", GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(stream.poll_next_unpin(&mut cx), Poll::Ready(None)));
+        assert_eq!(stream.buffer.capacity(), 0);
     }
 
     #[tokio::test]
