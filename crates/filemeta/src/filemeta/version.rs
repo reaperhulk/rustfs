@@ -918,7 +918,7 @@ impl FileMetaVersion {
     }
 
     pub fn header(&self) -> FileMetaVersionHeader {
-        FileMetaVersionHeader::from(self.clone())
+        FileMetaVersionHeader::from(self)
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
@@ -1398,6 +1398,12 @@ impl Ord for FileMetaVersionHeader {
 
 impl From<FileMetaVersion> for FileMetaVersionHeader {
     fn from(value: FileMetaVersion) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&FileMetaVersion> for FileMetaVersionHeader {
+    fn from(value: &FileMetaVersion) -> Self {
         let flags = {
             let mut f: u8 = 0;
             if value.free_version() {
@@ -1424,7 +1430,7 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
             version_id: value.get_version_id(),
             mod_time: value.get_mod_time(),
             signature: value.get_signature(),
-            version_type: value.version_type,
+            version_type: value.version_type.clone(),
             flags,
             ec_n,
             ec_m,
