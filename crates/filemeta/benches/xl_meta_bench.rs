@@ -14,7 +14,7 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, ObjectPartInfo, get_file_info, test_data::*,
+    FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetaObject, ObjectPartInfo, get_file_info, test_data::*,
 };
 use std::hint::black_box;
 
@@ -163,6 +163,8 @@ fn bench_object_metadata(c: &mut Criterion) {
     let encoded = meta.marshal_msg().expect("encode fixture metadata");
     let mut group = c.benchmark_group("object_metadata/plain_video");
     group.throughput(Throughput::Elements(1));
+    let object = MetaObject::from(fi.clone());
+    group.bench_function("signature", |b| b.iter(|| black_box(black_box(&object).get_signature())));
     group.bench_function("decode_validate", |b| {
         b.iter(|| {
             let decoded = get_file_info(

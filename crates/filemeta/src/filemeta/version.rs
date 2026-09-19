@@ -2064,25 +2064,13 @@ impl MetaObject {
     /// `xlMetaV2Object.Signature`. See [`FileMetaVersion::get_signature`] for
     /// why divergence detection requires covering every body field.
     pub fn get_signature(&self) -> [u8; 4] {
-        let mut c = self.clone();
-
-        // Zero fields that legitimately vary per disk within an erasure set.
-        c.erasure_index = 0;
-
-        // Treat an all-empty PartETags vector the same as an absent one, so two
-        // disks that encode `[]` vs `["", ""]` do not falsely diverge.
-        if c.part_etags.iter().all(String::is_empty) {
-            c.part_etags.clear();
-        }
-
         // Fold maps in with an order-independent hash: msgpack map order is not
         // stable across disks, so they must not be part of the marshaled body.
-        let mut crc = hash_deterministic_string(&c.meta_user);
-        crc ^= hash_deterministic_bytes(&c.meta_sys);
-        c.meta_sys.clear();
-        c.meta_user.clear();
+        let mut crc = hash_deterministic_string(&self.meta_user);
+        crc ^= hash_deterministic_bytes(&self.meta_sys);
 
-        if let Ok(bytes) = c.marshal_msg() {
+        let mut bytes = Vec::new();
+        if self.encode_to_inner(&mut bytes, true).is_ok() {
             crc ^= xxhash_rust::xxh64::xxh64(&bytes, XXHASH_SEED);
         }
 
@@ -2090,6 +2078,10 @@ impl MetaObject {
     }
 
     pub fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        self.encode_to_inner(wr, false)
+    }
+
+    fn encode_to_inner<W: std::io::Write>(&self, wr: &mut W, for_signature: bool) -> Result<()> {
         // Variable map size: omit PartIdx when empty
         let mut map_len = 18u32;
         if self.part_indices.is_empty() {
@@ -2123,7 +2115,8 @@ impl MetaObject {
 
         // EcIndex
         rmp::encode::write_str(wr, "EcIndex")?;
-        rmp::encode::write_sint(wr, self.erasure_index as i64)?;
+        // Disk indices differ within an erasure set but must have the same signature.
+        rmp::encode::write_sint(wr, if for_signature { 0 } else { self.erasure_index as i64 })?;
 
         // EcDist
         rmp::encode::write_str(wr, "EcDist")?;
@@ -2145,7 +2138,8 @@ impl MetaObject {
 
         // PartETags (write nil when empty)
         rmp::encode::write_str(wr, "PartETags")?;
-        if self.part_etags.is_empty() {
+        // Signatures treat all-empty ETags as absent; persisted metadata retains them.
+        if self.part_etags.is_empty() || (for_signature && self.part_etags.iter().all(String::is_empty)) {
             rmp::encode::write_nil(wr)?;
         } else {
             rmp::encode::write_array_len(wr, self.part_etags.len() as u32)?;
@@ -2192,7 +2186,7 @@ impl MetaObject {
 
         // MetaSys (write nil when empty)
         rmp::encode::write_str(wr, "MetaSys")?;
-        if self.meta_sys.is_empty() {
+        if for_signature || self.meta_sys.is_empty() {
             rmp::encode::write_nil(wr)?;
         } else {
             rmp::encode::write_map_len(wr, self.meta_sys.len() as u32)?;
@@ -2204,7 +2198,7 @@ impl MetaObject {
 
         // MetaUsr (write nil when empty)
         rmp::encode::write_str(wr, "MetaUsr")?;
-        if self.meta_user.is_empty() {
+        if for_signature || self.meta_user.is_empty() {
             rmp::encode::write_nil(wr)?;
         } else {
             rmp::encode::write_map_len(wr, self.meta_user.len() as u32)?;
@@ -5647,6 +5641,67 @@ mod tests {
         let mut all_empty = signed_object();
         all_empty.part_etags = vec![String::new(), String::new()];
         assert_eq!(none.get_signature(), all_empty.get_signature());
+    }
+
+    #[test]
+    fn signature_encoding_matches_clone_normalization() {
+        // Pin the signature produced for this fixture by the published encoder.
+        assert_eq!(signed_object().get_signature(), [114, 68, 190, 190]);
+        for part_count in [0, 1, 16] {
+            for etag_kind in 0..3 {
+                for map_kind in 0..4 {
+                    for disk_index in [0, 1, 6, usize::MAX] {
+                        let mut object = signed_object();
+                        object.erasure_index = disk_index;
+                        object.part_numbers = (1..=part_count).collect();
+                        object.part_sizes = vec![11; part_count];
+                        object.part_actual_sizes = vec![11; part_count];
+                        object.part_indices = vec![Bytes::from_static(b"index"); part_count];
+                        object.part_etags = match etag_kind {
+                            0 => Vec::new(),
+                            1 => vec![String::new(); part_count],
+                            _ => vec![String::new(), "etag".to_owned()],
+                        };
+                        object.meta_user.clear();
+                        if map_kind & 1 != 0 {
+                            object.meta_user.insert("content-type".into(), "video/mp4".into());
+                            object.meta_user.insert("x-amz-meta-owner".into(), "vidéo".into());
+                        }
+                        if map_kind & 2 != 0 {
+                            object.meta_sys.insert("binary".into(), vec![0, 128, 255]);
+                            object.meta_sys.insert("empty".into(), Vec::new());
+                        }
+
+                        let original = object.clone();
+                        let persisted = object.marshal_msg().expect("encode original object");
+                        let mut normalized = object.clone();
+                        normalized.erasure_index = 0;
+                        if normalized.part_etags.iter().all(String::is_empty) {
+                            normalized.part_etags.clear();
+                        }
+                        normalized.meta_user.clear();
+                        normalized.meta_sys.clear();
+                        let expected_body = normalized.marshal_msg().expect("encode clone-normalized body");
+                        let mut actual_body = Vec::new();
+                        object
+                            .encode_to_inner(&mut actual_body, true)
+                            .expect("encode borrowed signature body");
+                        assert_eq!(actual_body, expected_body, "signature normalization must preserve exact bytes");
+                        let expected_signature = fold_signature(
+                            hash_deterministic_string(&object.meta_user)
+                                ^ hash_deterministic_bytes(&object.meta_sys)
+                                ^ xxhash_rust::xxh64::xxh64(&expected_body, XXHASH_SEED),
+                        );
+                        assert_eq!(object.get_signature(), expected_signature);
+                        assert_eq!(object, original, "signature computation must not mutate metadata");
+                        assert_eq!(object.marshal_msg().expect("encode after signing"), persisted);
+                        let mut decoded = MetaObject::default();
+                        decoded.unmarshal_msg(&persisted).expect("decode persisted object");
+                        assert_eq!(decoded, original, "persisted encoding must not normalize signature fields");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
