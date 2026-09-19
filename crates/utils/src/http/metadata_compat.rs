@@ -227,18 +227,16 @@ pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
     if let Some(v) = with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.get(k2).cloned()) {
         return Some(v);
     }
-    // Rare fallback: case-insensitive scan for non-canonical key casing.
-    let (k1, k2) = both_keys(suffix);
+    // Also accepts non-canonical casing when neither canonical key exists.
     map.iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+        .find(|(key, _)| strip_internal_prefix_preserving_case(key).is_some_and(|rest| rest.eq_ignore_ascii_case(suffix)))
         .map(|(_, value)| value.clone())
 }
 
 fn get_consistent_value<'a, V: AsRef<[u8]>>(map: &'a HashMap<String, V>, suffix: &str) -> Option<&'a V> {
-    let (rustfs_key, minio_key) = both_keys(suffix);
     let mut value = None;
     for (key, candidate) in map {
-        if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
+        if !strip_internal_prefix_preserving_case(key).is_some_and(|rest| rest.eq_ignore_ascii_case(suffix)) {
             continue;
         }
         if candidate.as_ref().is_empty() || value.is_some_and(|current: &V| current.as_ref() != candidate.as_ref()) {
@@ -263,16 +261,14 @@ pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
     if with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.contains_key(k2)) {
         return true;
     }
-    let (k1, k2) = both_keys(suffix);
     map.keys()
-        .any(|key| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+        .any(|key| strip_internal_prefix_preserving_case(key).is_some_and(|rest| rest.eq_ignore_ascii_case(suffix)))
 }
 
 pub fn remove_str(map: &mut HashMap<String, String>, suffix: &str) {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
     with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
-    let (k1, k2) = both_keys(suffix);
-    map.retain(|key, _| !key.eq_ignore_ascii_case(&k1) && !key.eq_ignore_ascii_case(&k2));
+    map.retain(|key, _| !strip_internal_prefix_preserving_case(key).is_some_and(|rest| rest.eq_ignore_ascii_case(suffix)));
 }
 
 // === Vec<u8> type (meta_sys) ===
@@ -601,6 +597,48 @@ mod tests {
         let metadata = HashMap::from([("X-RustFS-Internal-Compression".to_string(), "s2".to_string())]);
         assert_eq!(get_str(&metadata, SUFFIX_COMPRESSION).as_deref(), Some("s2"));
         assert!(contains_key_str(&metadata, SUFFIX_COMPRESSION));
+    }
+
+    #[test]
+    fn string_lookups_and_removal_match_full_key_comparison() {
+        for suffix in [
+            "compression",
+            "COMPRESSION",
+            "réplication",
+            "k",
+            "K",
+            "",
+            &"x".repeat(INTERNAL_KEY_STACK_CAP),
+        ] {
+            let (rustfs_key, minio_key) = both_keys(suffix);
+            for prefix in [
+                RUSTFS_INTERNAL_PREFIX,
+                MINIO_INTERNAL_PREFIX,
+                "X-RustFS-Internal-",
+                "x-amz-meta-",
+            ] {
+                for stored_suffix in [suffix.to_owned(), suffix.to_ascii_uppercase(), format!("{suffix}-other")] {
+                    let map = HashMap::from([
+                        (format!("{prefix}{stored_suffix}"), "value".to_owned()),
+                        ("content-type".to_owned(), "video/mp4".to_owned()),
+                    ]);
+                    let expected = map.get(&rustfs_key).or_else(|| map.get(&minio_key)).or_else(|| {
+                        map.iter()
+                            .find(|(key, _)| key.eq_ignore_ascii_case(&rustfs_key) || key.eq_ignore_ascii_case(&minio_key))
+                            .map(|(_, value)| value)
+                    });
+                    assert_eq!(get_str(&map, suffix).as_ref(), expected, "suffix={suffix:?}, key={prefix}{stored_suffix}");
+                    assert_eq!(contains_key_str(&map, suffix), expected.is_some());
+                    assert_eq!(get_consistent_str(&map, suffix), expected.map(String::as_str));
+
+                    let mut removed = map.clone();
+                    remove_str(&mut removed, suffix);
+                    let mut reference = map;
+                    reference.retain(|key, _| !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key));
+                    assert_eq!(removed, reference);
+                }
+            }
+        }
     }
 
     #[test]
