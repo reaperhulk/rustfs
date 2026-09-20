@@ -16,13 +16,15 @@ use crate::diagnostics::get::{
     GET_SHARD_READ_COST_LOCAL, GET_SHARD_READ_COST_REMOTE, GET_SHARD_READ_COST_SAME_NODE, GET_SHARD_READ_COST_UNKNOWN,
 };
 use crate::disk::error::Error;
+use crate::erasure::codec::workspace::ReadShard;
 use crate::layout::disks_layout::MAX_ERASURE_SET_DRIVE_COUNT;
 use smallvec::SmallVec;
 
 /// Generic codec callers may exceed the production set limit; `SmallVec` then
 /// spills without changing slot semantics.
 pub(crate) const INLINE_SHARD_SLOTS: usize = MAX_ERASURE_SET_DRIVE_COUNT;
-pub(crate) type ShardBuffers = SmallVec<[Option<Vec<u8>>; INLINE_SHARD_SLOTS]>;
+pub(crate) type ShardBuffers = SmallVec<[Option<ReadShard>; INLINE_SHARD_SLOTS]>;
+pub(crate) type OwnedShardBuffers = SmallVec<[Option<Vec<u8>>; INLINE_SHARD_SLOTS]>;
 pub(crate) type ShardErrors = SmallVec<[Option<Error>; INLINE_SHARD_SLOTS]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +64,7 @@ pub(crate) struct StripeReadState {
 impl StripeReadState {
     #[cfg(test)]
     pub(crate) fn from_parts(shards: Vec<Option<Vec<u8>>>, errors: Vec<Option<Error>>, read_quorum: usize) -> Self {
-        let mut shards = SmallVec::from_vec(shards);
+        let mut shards: ShardBuffers = shards.into_iter().map(|shard| shard.map(ReadShard::Owned)).collect();
         let mut errors = SmallVec::from_vec(errors);
         let slot_count = shards.len().max(errors.len());
         shards.resize_with(slot_count, || None);
@@ -140,7 +142,7 @@ impl StripeReadState {
     }
 
     #[cfg(test)]
-    pub(crate) fn scratch_storage(&self) -> (*const Option<Vec<u8>>, *const Option<Error>, bool, bool) {
+    pub(crate) fn scratch_storage(&self) -> (*const Option<ReadShard>, *const Option<Error>, bool, bool) {
         (self.shards.as_ptr(), self.errors.as_ptr(), self.shards.spilled(), self.errors.spilled())
     }
 
@@ -191,7 +193,7 @@ mod tests {
 
         assert!(!state.can_decode());
         let (shards, errors) = state.into_parts();
-        assert_eq!(shards.as_slice(), &[Some(vec![1, 2, 3]), None]);
+        assert_eq!(shards.as_slice(), &[Some(ReadShard::Owned(vec![1, 2, 3])), None]);
         assert_eq!(errors.as_slice(), &[None, Some(Error::FileCorrupt)]);
     }
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::erasure::codec::workspace::RustfsCodecDecodeWorkspace;
-use crate::erasure::coding::Erasure;
+use crate::erasure::coding::{Erasure, erasure::ErasureShard};
 use rustfs_erasure_codec::galois_8::ReedSolomon;
 use std::io;
 use std::sync::{Arc, OnceLock};
@@ -46,15 +46,19 @@ pub(crate) trait ErasureDecodeEngine: Send + Sync + 'static {
 
     fn prepare_workspace(&self, shard_len: usize) -> io::Result<Self::Workspace>;
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<&'static str>;
+    fn reconstruct_into<B: ErasureShard>(
+        &self,
+        shards: &mut [Option<B>],
+        workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str>;
 }
 
-fn data_shards_complete(shards: &[Option<Vec<u8>>], data_shards: usize) -> bool {
+fn data_shards_complete<B: ErasureShard>(shards: &[Option<B>], data_shards: usize) -> bool {
     shards.len() >= data_shards && shards.iter().take(data_shards).all(Option::is_some)
 }
 
-fn recover_empty_payload_data_shards(
-    shards: &mut [Option<Vec<u8>>],
+fn recover_empty_payload_data_shards<B: ErasureShard>(
+    shards: &mut [Option<B>],
     data_shards: usize,
     parity_shards: usize,
 ) -> io::Result<bool> {
@@ -80,7 +84,7 @@ fn recover_empty_payload_data_shards(
 
     for shard in shards.iter_mut().take(data_shards) {
         if shard.is_none() {
-            *shard = Some(Vec::new());
+            *shard = Some(Vec::new().into());
         }
     }
 
@@ -152,7 +156,11 @@ impl ErasureDecodeEngine for LegacyEcDecodeEngine {
         Ok(LegacyDecodeWorkspace::new(shard_len))
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<&'static str> {
+    fn reconstruct_into<B: ErasureShard>(
+        &self,
+        shards: &mut [Option<B>],
+        _workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str> {
         if data_shards_complete(shards, self.erasure.data_shards) {
             return Ok(GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE);
         }
@@ -199,13 +207,18 @@ impl RustfsCodecDecodeEngine {
         Ok(Some(codec))
     }
 
-    fn needs_source_parity_verification(&self, shards: &[Option<Vec<u8>>]) -> bool {
+    fn needs_source_parity_verification<B: ErasureShard>(&self, shards: &[Option<B>]) -> bool {
         let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
         let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
         missing_data_source && available_shards > self.data_shards
     }
 
-    fn verify_source_parity(&self, codec: &ReedSolomon, shards: &[Option<Vec<u8>>], needs_verification: bool) -> io::Result<()> {
+    fn verify_source_parity<B: ErasureShard>(
+        &self,
+        codec: &ReedSolomon,
+        shards: &[Option<B>],
+        needs_verification: bool,
+    ) -> io::Result<()> {
         if !needs_verification {
             return Ok(());
         }
@@ -221,7 +234,7 @@ impl RustfsCodecDecodeEngine {
                     format!("missing shard {index} after RustFS codec reconstruction"),
                 )
             })?;
-            shard_refs.push(shard.as_slice());
+            shard_refs.push(shard.as_ref());
         }
 
         let valid = codec
@@ -271,7 +284,11 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
         Ok(RustfsCodecDecodeWorkspace::new(shard_len))
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<&'static str> {
+    fn reconstruct_into<B: ErasureShard>(
+        &self,
+        shards: &mut [Option<B>],
+        _workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str> {
         if data_shards_complete(shards, self.data_shards) {
             return Ok(GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE);
         }
@@ -281,7 +298,11 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
 
         if let Some(codec) = self.codec()? {
             let needs_source_parity_verification = self.needs_source_parity_verification(shards);
-            if needs_source_parity_verification {
+            let mut owned: crate::set_disk::shard_source::OwnedShardBuffers = shards
+                .iter_mut()
+                .map(|shard| shard.take().map(ErasureShard::into_vec))
+                .collect();
+            let result = if needs_source_parity_verification {
                 // Rebuild missing parity together with missing data so the
                 // shard set is complete for `verify`. Rebuilt parity is
                 // consistent with the reconstructed data by construction, so
@@ -293,13 +314,17 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
                 // example one missing data shard plus one missing parity
                 // shard) as an inconsistent-source failure.
                 codec
-                    .reconstruct_opt(shards)
-                    .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
+                    .reconstruct_opt(&mut owned)
+                    .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))
             } else {
                 codec
-                    .reconstruct_data_opt(shards)
-                    .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
+                    .reconstruct_data_opt(&mut owned)
+                    .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))
+            };
+            for (shard, data) in shards.iter_mut().zip(owned) {
+                *shard = data.map(B::from);
             }
+            result?;
             self.verify_source_parity(&codec, shards, needs_source_parity_verification)?;
         }
 
@@ -389,7 +414,11 @@ impl ErasureDecodeEngine for CodecStreamingDecodeEngine {
         }
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<&'static str> {
+    fn reconstruct_into<B: ErasureShard>(
+        &self,
+        shards: &mut [Option<B>],
+        workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str> {
         match (self, workspace) {
             (Self::Legacy(engine), CodecStreamingDecodeWorkspace::Legacy(workspace)) => {
                 engine.reconstruct_into(shards, workspace)
@@ -428,6 +457,40 @@ mod tests {
         let shards = vec![Some(vec![1]), Some(vec![2]), None];
 
         assert!(data_shards_complete(&shards, 2));
+    }
+
+    #[test]
+    fn shared_codec_buffers_match_owned_recovery_for_every_missing_shard_set() {
+        use crate::erasure::codec::workspace::ReadShard;
+        let erasure = Erasure::new(2, 2, 4096);
+        let encoded = erasure.encode_data(&vec![0x53; 4096]).expect("encode");
+        for engine in [
+            CodecStreamingDecodeEngine::legacy(erasure.clone()),
+            CodecStreamingDecodeEngine::rustfs(&erasure).expect("engine"),
+        ] {
+            for missing in 0..16 {
+                let mut shared: Vec<_> = encoded
+                    .iter()
+                    .enumerate()
+                    .map(|(i, bytes)| (missing & (1 << i) == 0).then(|| ReadShard::Shared(bytes.clone())))
+                    .collect();
+                let mut owned: Vec<_> = shared.iter().map(|shard| shard.as_ref().map(|data| data.to_vec())).collect();
+                let mut workspace = engine.prepare_workspace(erasure.shard_size()).expect("workspace");
+                let expected = engine.reconstruct_into(&mut owned, &mut workspace);
+                let actual = engine.reconstruct_into(&mut shared, &mut workspace);
+                assert_eq!(
+                    actual.as_ref().err().map(|e| (e.kind(), e.to_string())),
+                    expected.as_ref().err().map(|e| (e.kind(), e.to_string()))
+                );
+                assert_eq!(actual.ok(), expected.ok());
+                for (index, (actual, expected)) in shared.iter().zip(&owned).enumerate() {
+                    assert_eq!(actual.as_deref(), expected.as_deref(), "missing mask {missing}");
+                    if missing == 0 {
+                        assert_eq!(actual.as_ref().expect("healthy shard").as_ptr(), encoded[index].as_ptr());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

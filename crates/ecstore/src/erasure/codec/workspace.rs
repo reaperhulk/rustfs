@@ -12,6 +12,82 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// A verified shard can share its source allocation until recovery mutates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadShard {
+    Owned(Vec<u8>),
+    Shared(bytes::Bytes),
+}
+
+impl std::ops::Deref for ReadShard {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
+
+impl AsRef<[u8]> for ReadShard {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for ReadShard {
+    fn as_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(data) => {
+                *self = Self::Owned(data.to_vec());
+                self.as_mut()
+            }
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a ReadShard {
+    type Item = &'a u8;
+    type IntoIter = std::slice::Iter<'a, u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl From<Vec<u8>> for ReadShard {
+    fn from(data: Vec<u8>) -> Self {
+        Self::Owned(data)
+    }
+}
+
+impl FromIterator<u8> for ReadShard {
+    fn from_iter<I: IntoIterator<Item = u8>>(iter: I) -> Self {
+        Self::Owned(iter.into_iter().collect())
+    }
+}
+
+impl crate::erasure::coding::erasure::ErasureShard for ReadShard {
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(data) => data.to_vec(),
+        }
+    }
+}
+
+impl ReadShard {
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::Owned(data) => data.capacity(),
+            Self::Shared(data) => data.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RustfsCodecDecodeWorkspace {
     shard_len: usize,
@@ -93,6 +169,21 @@ impl ShardBufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_read_shard_copies_only_when_mutated() {
+        let source = bytes::Bytes::from(vec![11, 22, 33, 44]);
+        let mut shard = ReadShard::Shared(source.slice(1..3));
+        assert_eq!(shard.as_ptr(), source[1..].as_ptr());
+        let retained = shard.clone();
+        shard.as_mut()[0] = 99;
+        assert_eq!(shard.as_ref(), &[99, 33]);
+        assert_eq!(retained.as_ref(), &[22, 33]);
+        assert_eq!(source.as_ref(), &[11, 22, 33, 44]);
+        let owned_ptr = shard.as_ptr();
+        shard.as_mut()[1] = 88;
+        assert_eq!(shard.as_ptr(), owned_ptr, "subsequent writes reuse the copy");
+    }
 
     /// `take` hands out capacity, never length: the caller appends every byte it
     /// will read back. Reusing a slot must keep the allocation and must not memset

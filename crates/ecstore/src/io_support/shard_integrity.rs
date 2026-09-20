@@ -334,10 +334,10 @@ struct ProofCache {
 }
 
 impl PartProofReader {
-    pub(crate) async fn reconstruction_proof(
+    pub(crate) async fn reconstruction_proof<B: AsRef<[u8]>>(
         &self,
         stripe: usize,
-        shards: &[Option<Vec<u8>>],
+        shards: &[Option<B>],
     ) -> io::Result<Option<ReconstructionProof>> {
         let mut missing = 0u16;
         for (index, shard) in shards.iter().take(usize::from(self.part.layout.data)).enumerate() {
@@ -543,12 +543,16 @@ pub(crate) struct ReconstructionProof {
 }
 
 impl ReconstructionProof {
-    pub(crate) fn verify(&self, shards: &[Option<Vec<u8>>]) -> io::Result<()> {
+    pub(crate) fn verify<B: AsRef<[u8]>>(&self, shards: &[Option<B>]) -> io::Result<()> {
         for index in 0..usize::from(self.part.layout.data) {
             if self.missing & (1 << index) == 0 {
                 continue;
             }
-            let payload = shards.get(index).and_then(Option::as_deref).ok_or_else(corrupt)?;
+            let payload = shards
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(AsRef::as_ref)
+                .ok_or_else(corrupt)?;
             let actual = self.part.shard_digest(self.stripe, index, payload).map_err(|_| corrupt())?;
             if self.record.get(index * 32..(index + 1) * 32) != Some(actual.as_slice()) {
                 return Err(corrupt());
@@ -811,6 +815,50 @@ mod tests {
         verifier.verify(shards[0]).await.expect("stripe 0");
         verifier.verify(shards[0]).await.expect("stripe 1");
         assert!(verifier.verify(shards[0]).await.is_err(), "no clean success past committed stripes");
+    }
+
+    #[tokio::test]
+    async fn shared_bitrot_shard_checks_the_committed_integrity_proof() {
+        use crate::erasure::coding::{BitrotReader, BitrotWriter};
+        let mut builder = IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("builder");
+        builder
+            .push([b"abcd".as_slice(), b"efgh", b"ijkl", b"mnop"].into_iter())
+            .await
+            .expect("stripe");
+        let prepared = builder.finish(8).await.expect("index");
+        let inline = prepared.inline_bytes().expect("inline proof");
+        let proof = Arc::new(PartProofReader {
+            part: prepared.part,
+            inline: Some(inline),
+            sources: Vec::new(),
+            volume: String::new(),
+            cached: Mutex::new(ProofCache::default()),
+        });
+        for payload in [b"abcd", b"wxyz"] {
+            let mut framed = Vec::new();
+            BitrotWriter::new(&mut framed, 4, rustfs_utils::HashAlgorithm::HighwayHash256S)
+                .write(payload)
+                .await
+                .expect("valid bitrot frame");
+            let mut reader = BitrotReader::new(
+                std::io::Cursor::new(Bytes::from(framed)),
+                4,
+                rustfs_utils::HashAlgorithm::HighwayHash256S,
+                true,
+            );
+            reader
+                .set_integrity(ShardVerifier::new(proof.clone(), 0, 0, None).expect("verifier"))
+                .expect("attach proof");
+            let result = reader.read_shard(Vec::new(), 4).await;
+            if payload == b"abcd" {
+                assert_eq!(result.expect("committed bytes").as_ref(), payload);
+            } else {
+                assert_eq!(
+                    result.expect_err("valid bitrot with a different committed payload").kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+        }
     }
 
     #[tokio::test]
