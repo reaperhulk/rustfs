@@ -274,6 +274,32 @@ impl<R> BitrotReader<R>
 where
     R: ShardSource,
 {
+    /// Retain an already-materialized block after both integrity checks pass.
+    pub(crate) async fn read_shard(
+        &mut self,
+        mut buffer: Vec<u8>,
+        want: usize,
+    ) -> std::io::Result<crate::erasure::codec::workspace::ReadShard> {
+        use crate::erasure::codec::workspace::ReadShard;
+
+        self.begin_read(want)?;
+        let hash_size = self.hash_algo.size();
+        if hash_size != 0
+            && let Some(block) = self.inner.try_take_block(hash_size + want)
+        {
+            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
+            self.last_verify_duration = verify;
+            if let Some(integrity) = &mut self.integrity {
+                integrity.verify(data).await?;
+            }
+            return Ok(ReadShard::Shared(block.slice(hash_size..)));
+        }
+
+        buffer.clear();
+        self.read_appending(&mut buffer, want).await?;
+        Ok(ReadShard::Owned(buffer))
+    }
+
     /// Same contract as [`Self::read`], but **appends** `want` bytes into `out`'s
     /// spare capacity instead of demanding an initialized `&mut [u8]`
     /// (rustfs/backlog#1159).
@@ -1985,6 +2011,66 @@ mod tests {
         let mut out = vec![0u8; shard_size];
         let err = r.read(&mut out).await.expect_err("truncated hash must error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn read_shard_retains_verified_blocks_and_partial_tail() {
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![0x73; SHARD + 17];
+        let mut encoded = Vec::new();
+        let mut writer = BitrotWriter::new(&mut encoded, SHARD, algo.clone());
+        writer.write(&data[..SHARD]).await.expect("write full shard");
+        writer.write(&data[SHARD..]).await.expect("write tail shard");
+        let source = bytes::Bytes::from(encoded);
+        let mut reader = BitrotReader::new(Cursor::new(source.clone()), SHARD, algo.clone(), false);
+        let first = reader.read_shard(Vec::new(), SHARD).await.expect("read first shard");
+        assert_eq!(first.as_ptr(), source[algo.size()..].as_ptr(), "retain the source allocation");
+        let tail = reader.read_shard(Vec::new(), 17).await.expect("read partial tail");
+        assert_eq!(first.as_ref(), &data[..SHARD]);
+        assert_eq!(tail.as_ref(), &data[SHARD..]);
+        assert_eq!(tail.as_ptr(), source[SHARD + 2 * algo.size()..].as_ptr());
+        drop(reader);
+        drop(source);
+        assert_eq!(first.as_ref(), &data[..SHARD], "returned bytes outlive the reader");
+    }
+
+    #[tokio::test]
+    async fn read_shard_reuses_streaming_buffer_and_preserves_errors() {
+        const SHARD: usize = 4096;
+        for algo in [HashAlgorithm::HighwayHash256S, HashAlgorithm::None] {
+            let data = vec![0x42; SHARD];
+            let encoded = encode_one_block(&data, SHARD, algo.clone()).await;
+            let reusable = Vec::with_capacity(SHARD);
+            let ptr = reusable.as_ptr();
+            let mut reader = BitrotReader::new(Cursor::new(encoded.clone()), SHARD, algo.clone(), false);
+            let result = reader.read_shard(reusable, SHARD).await.expect("streaming shard");
+            assert_eq!(result.as_ref(), data);
+            assert_eq!(result.as_ptr(), ptr, "streaming reads reuse the caller's allocation");
+            for source in [encoded[..encoded.len() - 1].to_vec(), Vec::new()] {
+                let mut reader = BitrotReader::new(Cursor::new(bytes::Bytes::from(source)), SHARD, algo.clone(), false);
+                assert_eq!(
+                    reader.read_shard(Vec::new(), SHARD).await.expect_err("short shard").kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+            }
+        }
+        let algo = HashAlgorithm::HighwayHash256S;
+        let mut encoded = encode_one_block(&vec![0x42; SHARD], SHARD, algo.clone()).await;
+        encoded[algo.size()] ^= 1;
+        let mut reader = BitrotReader::new(Cursor::new(bytes::Bytes::from(encoded)), SHARD, algo, false);
+        assert_eq!(
+            reader.read_shard(Vec::new(), SHARD).await.expect_err("corrupt shard").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            reader
+                .read_shard(Vec::new(), SHARD + 1)
+                .await
+                .expect_err("oversized shard")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     /// `read_appending` must be byte-for-byte identical to `read`, for both the

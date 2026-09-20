@@ -22,11 +22,11 @@ use crate::diagnostics::get::{
 use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::error::{Error, is_terminal_read_error};
 use crate::disk::error_reduce::reduce_errs;
-use crate::erasure::codec::workspace::ShardBufferPool;
+use crate::erasure::codec::workspace::{ReadShard, ShardBufferPool};
 use crate::erasure::coding::{BitrotReader, Erasure};
 use crate::io_support::bitrot::DeferredReaderStripeHandle;
 use crate::set_disk::shard_source::{
-    INLINE_SHARD_SLOTS, ShardBuffers, ShardErrors, ShardReadCost, ShardStripeSource, StripeReadState,
+    INLINE_SHARD_SLOTS, OwnedShardBuffers, ShardBuffers, ShardErrors, ShardReadCost, ShardStripeSource, StripeReadState,
 };
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -42,9 +42,9 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, warn};
 
-type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
+type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<ReadShard, Error>, bool)> + Send + 'a>>;
 type OwnedShardReadFuture<'a, R> =
-    Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, Option<BitrotReader<R>>, bool)> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<ReadShard, Error>, Option<BitrotReader<R>>, bool)> + Send + 'a>>;
 pub(crate) type DeferredReaderReopener<R> = Arc<dyn Fn(usize) -> Option<BitrotReader<R>> + Send + Sync>;
 pub(crate) type DecodeOutcome = (usize, Option<std::io::Error>, bool);
 
@@ -320,20 +320,17 @@ async fn read_shard_result<R>(
     data_shards: usize,
     read_timeout: Duration,
     metrics_path: Option<&'static str>,
-) -> (Result<Vec<u8>, Error>, bool)
+) -> (Result<ReadShard, Error>, bool)
 where
     R: crate::erasure::coding::ShardSource,
 {
     let role = shard_role(index, data_shards);
-    // Capacity, not length: `read_appending` writes every byte it returns, so
-    // the buffer never needs zeroing first (rustfs/backlog#1159).
-    let mut buf = recycled_buf.unwrap_or_else(|| Vec::with_capacity(shard_size));
-    buf.clear();
+    let buf = recycled_buf.unwrap_or_default();
     let read_start = metrics_path.map(|_| Instant::now());
     let read_result = if read_timeout.is_zero() {
-        reader.read_appending(&mut buf, shard_size).await
+        reader.read_shard(buf, shard_size).await
     } else {
-        match tokio::time::timeout(read_timeout, reader.read_appending(&mut buf, shard_size)).await {
+        match tokio::time::timeout(read_timeout, reader.read_shard(buf, shard_size)).await {
             Ok(result) => result,
             Err(_) => {
                 let timeout_error = io::Error::new(ErrorKind::TimedOut, "shard read timed out");
@@ -357,8 +354,8 @@ where
     };
 
     match read_result {
-        Ok(n) => {
-            debug_assert_eq!(buf.len(), n, "read_appending must grow the buffer by exactly n");
+        Ok(buf) => {
+            let n = buf.len();
             if let Some(path) = metrics_path {
                 rustfs_io_metrics::record_get_object_shard_read_observation(
                     path,
@@ -545,7 +542,7 @@ fn launch_owned_reader<'a, R>(
 where
     R: crate::erasure::coding::ShardSource + 'a,
 {
-    let recycled_buf = Some(buffers.take(index, shard_size));
+    let recycled_buf = Some(buffers.take(index, 0));
     *scheduled += 1;
     active[index] = true;
     sets.push(read_shard_owned(
@@ -838,14 +835,14 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn record_shard_read_result(
-    shards: &mut [Option<Vec<u8>>],
+    shards: &mut [Option<ReadShard>],
     errs: &mut [Option<Error>],
     retire_readers: &mut ShardIndexes,
     success: &mut usize,
     successful_costs: &mut ShardReadCostCounts,
     i: usize,
     read_cost: ShardReadCost,
-    result: Result<Vec<u8>, Error>,
+    result: Result<ReadShard, Error>,
     should_retire: bool,
 ) -> bool {
     match result {
@@ -894,7 +891,7 @@ fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
 /// layout from opening every remaining shard at once.  As a read completes the
 /// caller invokes this again, which refills one slot after a failure or a
 /// successful-but-insufficient parity result.
-fn demand_bound_parity_admission_limit(shards: &[Option<Vec<u8>>], active: &[bool], data_shards: usize) -> usize {
+fn demand_bound_parity_admission_limit(shards: &[Option<ReadShard>], active: &[bool], data_shards: usize) -> usize {
     let missing_data = shards.iter().take(data_shards).filter(|shard| shard.is_none()).count();
     if missing_data == 0 {
         return 0;
@@ -1033,11 +1030,7 @@ where
                 if let Some((i, reader)) = reader_iter.next() {
                     let has_reader = reader.is_some();
                     // Only claim a request-scoped buffer when a shard will actually be read.
-                    let recycled_buf = if has_reader {
-                        Some(self.buffers.take(i, shard_size))
-                    } else {
-                        None
-                    };
+                    let recycled_buf = if has_reader { Some(self.buffers.take(i, 0)) } else { None };
                     let read_cost = read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
                     record_scheduled_read_cost(
                         read_cost,
@@ -1082,7 +1075,7 @@ where
                                     if let Some((next_i, next_reader)) = reader_iter.next() {
                                         let has_reader = next_reader.is_some();
                                         let recycled_buf = if has_reader {
-                                            Some(self.buffers.take(next_i, shard_size))
+                                            Some(self.buffers.take(next_i, 0))
                                         } else {
                                             None
                                         };
@@ -1153,7 +1146,7 @@ where
                     if let Some((next_i, next_reader)) = reader_iter.next() {
                         let has_reader = next_reader.is_some();
                         let recycled_buf = if has_reader {
-                            Some(self.buffers.take(next_i, shard_size))
+                            Some(self.buffers.take(next_i, 0))
                         } else {
                             None
                         };
@@ -1337,10 +1330,10 @@ where
         // Pre-claim per-slot buffers so the `self.readers` borrow below stays
         // disjoint from `self.buffers`; `Some(buffer)` also records which slots
         // participate, avoiding a per-stripe sidecar allocation.
-        let mut bufs: ShardBuffers = SmallVec::with_capacity(num_readers);
+        let mut bufs: OwnedShardBuffers = SmallVec::with_capacity(num_readers);
         for i in 0..num_readers {
             bufs.push(if self.engaged[i] && self.readers[i].is_some() {
-                Some(self.buffers.take(i, shard_size))
+                Some(self.buffers.take(i, 0))
             } else {
                 None
             });
@@ -1518,7 +1511,7 @@ where
                 continue;
             }
             let read_cost = self.read_costs.get(idx).copied().unwrap_or(ShardReadCost::Unknown);
-            let recycled_buf = Some(self.buffers.take(idx, shard_size));
+            let recycled_buf = Some(self.buffers.take(idx, 0));
             scheduled += 1;
             let (i, _read_cost, result, _should_retire) = read_shard(
                 idx,
@@ -2004,12 +1997,14 @@ where
         }
     }
 
-    pub fn recycle_shards(&mut self, shards: &mut [Option<Vec<u8>>]) {
+    pub fn recycle_shards(&mut self, shards: &mut [Option<ReadShard>]) {
         for (i, reader) in self.readers.iter().enumerate() {
             if reader.is_some()
                 && let Some(buf) = shards.get_mut(i).and_then(Option::take)
             {
-                self.buffers.put(i, buf);
+                if let ReadShard::Owned(buf) = buf {
+                    self.buffers.put(i, buf);
+                }
             }
         }
     }
@@ -2055,7 +2050,7 @@ where
 }
 
 /// Get the total length of data blocks
-fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
+fn get_data_block_len(shards: &[Option<ReadShard>], data_blocks: usize) -> usize {
     let mut size = 0;
     for shard in shards.iter().take(data_blocks).flatten() {
         size += shard.len();
@@ -2081,7 +2076,7 @@ where
 /// Write data blocks from encoded blocks to target, supporting offset and length
 async fn write_data_blocks<W>(
     writer: &mut W,
-    en_blocks: &[Option<Vec<u8>>],
+    en_blocks: &[Option<ReadShard>],
     data_blocks: usize,
     mut offset: usize,
     length: usize,
@@ -2368,7 +2363,7 @@ impl Erasure {
     async fn emit_decoded_stripe<W>(
         &self,
         writer: &mut W,
-        shards: &mut [Option<Vec<u8>>],
+        shards: &mut [Option<ReadShard>],
         errs: &[Option<Error>],
         block_offset: usize,
         block_length: usize,
@@ -2819,6 +2814,65 @@ mod tests {
 
     type BoxedShardReader = crate::io_support::bitrot::ShardReader;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shared_shards_match_streaming_decode_for_ranges_and_failures() {
+        const BLOCK: usize = 4096;
+        let data: Vec<u8> = (0..BLOCK * 2 + 17).map(|i| i.to_le_bytes()[0]).collect();
+        let algo = HashAlgorithm::HighwayHash256S;
+        for legacy in [false, true] {
+            let erasure = Erasure::new_with_options(2, 2, BLOCK, legacy);
+            let shard_size = erasure.shard_size();
+            let encoded = encode_prefetch_object(&erasure, &data, &algo).await;
+            for scenario in 0..5 {
+                let mut framed = encoded.clone();
+                match scenario {
+                    1 => framed[0].clear(),
+                    2 => framed[0][algo.size()] ^= 1,
+                    3 => {
+                        for shard in &mut framed[..3] {
+                            shard[shard_size + 2 * algo.size()] ^= 1;
+                        }
+                    }
+                    4 => framed[0].truncate(algo.size() + 1),
+                    _ => {}
+                }
+                for (offset, length) in [(0, data.len()), (17, BLOCK + 23), (BLOCK, BLOCK), (BLOCK * 2, 17)] {
+                    let position = offset / BLOCK * (shard_size + algo.size());
+                    let streamed = framed
+                        .iter()
+                        .map(|bytes| {
+                            let mut cursor = Cursor::new(bytes.clone());
+                            cursor.set_position(u64::try_from(position).expect("test offset"));
+                            Some(BitrotReader::new(cursor, shard_size, algo.clone(), false))
+                        })
+                        .collect();
+                    let shared = framed
+                        .iter()
+                        .map(|bytes| {
+                            let mut cursor = Cursor::new(bytes::Bytes::from(bytes.clone()));
+                            cursor.set_position(u64::try_from(position).expect("test offset"));
+                            Some(BitrotReader::new(cursor, shard_size, algo.clone(), false))
+                        })
+                        .collect();
+                    let mut expected = Vec::new();
+                    let mut actual = Vec::new();
+                    let (expected_written, expected_error) =
+                        erasure.decode(&mut expected, streamed, offset, length, data.len()).await;
+                    let (written, error) = erasure.decode(&mut actual, shared, offset, length, data.len()).await;
+                    let error_key = |error: Option<io::Error>| error.map(|e| (e.kind(), e.to_string()));
+                    assert_eq!(written, expected_written, "legacy={legacy}, scenario={scenario}, offset={offset}");
+                    assert_eq!(error_key(error), error_key(expected_error));
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual, data[offset..offset + written]);
+                    if scenario == 0 {
+                        assert_eq!(written, length);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn parallel_reader_keeps_stripe_scratch_out_of_line() {
         assert_eq!(
@@ -3186,7 +3240,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_writes_range_across_blocks() {
-        let blocks = vec![Some(vec![1, 2, 3, 4]), Some(vec![5, 6, 7]), Some(vec![8, 9])];
+        let blocks = vec![
+            Some(ReadShard::Owned(vec![1, 2, 3, 4])),
+            Some(ReadShard::Owned(vec![5, 6, 7])),
+            Some(ReadShard::Owned(vec![8, 9])),
+        ];
         let mut out = Vec::new();
 
         let written = write_data_blocks(&mut out, &blocks, 3, 2, 5).await.unwrap();
@@ -3197,7 +3255,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_short_data_after_offset() {
-        let blocks = vec![Some(vec![1, 2, 3, 4]), Some(vec![5, 6, 7])];
+        let blocks = vec![
+            Some(ReadShard::Owned(vec![1, 2, 3, 4])),
+            Some(ReadShard::Owned(vec![5, 6, 7])),
+        ];
         let mut out = Vec::new();
 
         let err = write_data_blocks(&mut out, &blocks, 2, 3, 5).await.unwrap_err();
@@ -3208,7 +3269,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_invalid_data_block_count() {
-        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let blocks = vec![Some(ReadShard::Owned(vec![1, 2, 3, 4]))];
         let mut out = Vec::new();
 
         let err = write_data_blocks(&mut out, &blocks, 2, 0, 1).await.unwrap_err();
@@ -3219,7 +3280,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_offset_length_overflow() {
-        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let blocks = vec![Some(ReadShard::Owned(vec![1, 2, 3, 4]))];
         let mut out = Vec::new();
 
         let err = write_data_blocks(&mut out, &blocks, 1, usize::MAX, 1).await.unwrap_err();
@@ -3230,7 +3291,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_missing_data_shard_even_when_total_bytes_are_available() {
-        let blocks = vec![None, Some(vec![1, 2, 3, 4])];
+        let blocks = vec![None, Some(ReadShard::Owned(vec![1, 2, 3, 4]))];
         let mut out = Vec::new();
 
         let err = write_data_blocks(&mut out, &blocks, 2, 0, 1).await.unwrap_err();
@@ -3241,7 +3302,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_propagates_writer_emit_failure() {
-        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let blocks = vec![Some(ReadShard::Owned(vec![1, 2, 3, 4]))];
         let mut writer = FailingEmitWriter;
 
         let err = write_data_blocks(&mut writer, &blocks, 1, 0, 4)
