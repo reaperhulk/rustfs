@@ -8898,8 +8898,6 @@ impl LocalDisk {
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
     tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::FileExt;
-
         let mut results = Vec::with_capacity(n);
         for (file_path, offset, length) in requests {
             let r = (|| -> Result<Bytes> {
@@ -8910,18 +8908,26 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                 }
 
                 let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
-                let mut buf = vec![0u8; length];
+                let mut buf = Vec::with_capacity(length);
+                // Keep the writable spare capacity bounded to the requested range,
+                // even if the allocator grants more capacity than requested.
+                let prefix = buf.capacity() - length;
+                buf.resize(prefix, 0);
                 let mut total = 0usize;
                 while total < length {
-                    let nbytes = file
-                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
-                        .map_err(DiskError::from)?;
+                    let nbytes = rustix::io::pread(
+                        &file,
+                        rustix::buffer::spare_capacity(&mut buf),
+                        u64::try_from(offset + total).unwrap_or(u64::MAX),
+                    )
+                    .map_err(std::io::Error::from)
+                    .map_err(DiskError::from)?;
                     if nbytes == 0 {
                         return Err(DiskError::FileCorrupt);
                     }
                     total += nbytes;
                 }
-                Ok(Bytes::from(buf))
+                Ok(Bytes::from(buf).slice(prefix..))
             })();
             results.push(r);
         }
@@ -23591,6 +23597,67 @@ mod test {
         assert_eq!(results[0].as_ref().unwrap().as_ref(), b"good data");
         assert!(results[1].is_err());
         assert!(matches!(results[1].as_ref().unwrap_err(), DiskError::Io(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_ranges_and_empty() {
+        let dir = tempfile::tempdir().expect("create shard fixture directory");
+        let path = dir.path().join("shard.bin");
+        let payload: Vec<u8> = (0..=u8::MAX).cycle().take(1024 * 1024 + 3).collect();
+        std::fs::write(&path, &payload).expect("write shard fixture");
+        let ranges = [
+            (0, 0),
+            (0, payload.len()),
+            (17, 65539),
+            (payload.len() - 1, 1),
+            (payload.len(), 0),
+        ];
+        let results = batch_shard_pread(
+            ranges
+                .iter()
+                .map(|&(offset, length)| (path.clone(), offset, length))
+                .collect(),
+        )
+        .await;
+
+        assert_eq!(results.len(), ranges.len());
+        for (result, &(offset, length)) in results.iter().zip(&ranges) {
+            assert_eq!(
+                result.as_ref().expect("read valid shard range").as_ref(),
+                &payload[offset..offset + length]
+            );
+        }
+        assert!(batch_shard_pread(Vec::new()).await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_rejects_invalid_ranges_without_losing_other_results() {
+        let dir = tempfile::tempdir().expect("create shard fixture directory");
+        let path = dir.path().join("shard.bin");
+        std::fs::write(&path, b"shard").expect("write shard fixture");
+        let invalid_ranges = [(5, 1), (6, 0), (usize::MAX, 1), (1, usize::MAX)];
+        let mut requests: Vec<_> = invalid_ranges
+            .iter()
+            .map(|&(offset, length)| (path.clone(), offset, length))
+            .collect();
+        requests.push((path, 1, 3));
+        let results = batch_shard_pread(requests).await;
+
+        assert_eq!(results.len(), invalid_ranges.len() + 1);
+        for result in &results[..invalid_ranges.len()] {
+            assert!(matches!(result, Err(DiskError::FileCorrupt)));
+        }
+        assert_eq!(
+            results
+                .last()
+                .expect("final result")
+                .as_ref()
+                .expect("valid range after errors")
+                .as_ref(),
+            b"har"
+        );
     }
 
     #[cfg(any(unix, windows))]
